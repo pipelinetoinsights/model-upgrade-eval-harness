@@ -1,0 +1,146 @@
+# Fixed, version-controlled task set for the pipeline-failure triage agent.
+#
+# Each case: id, category, input (raw error exactly as the agent receives it),
+# expected_root_cause, expected_next_action.
+#
+# Categories: schema_change | permissions | resource_limit | upstream_data
+#             | config | transient | code_bug
+#
+# Keep ~15-30 cases for a one-off upgrade decision. Add a row for every new
+# production incident; retire cases whose root cause can no longer occur.
+
+- id: airflow-oom-01
+  category: resource_limit
+  input: |
+    [2026-08-14 03:12:44] Task exited with return code Negsignal.SIGKILL
+    airflow.exceptions.AirflowException: Task received SIGKILL signal
+    KubernetesPodOperator: pod evicted, memory usage 4.1Gi exceeds limit 4Gi
+  expected_root_cause: worker pod killed for exceeding its memory limit
+  expected_next_action: raise the pod memory limit or reduce the batch size for this task
+
+- id: spark-executor-oom-02
+  category: resource_limit
+  input: |
+    ExecutorLostFailure (executor 7 exited caused by one of the running tasks)
+    Reason: Container killed by YARN for exceeding memory limits. 11.2 GB of 11 GB physical memory used.
+    Consider boosting spark.executor.memoryOverhead.
+  expected_root_cause: executor exceeded its container memory including overhead
+  expected_next_action: increase spark.executor.memoryOverhead or repartition to shrink per-task data
+
+- id: dbt-schema-drift-03
+  category: schema_change
+  input: |
+    Database Error in model stg_orders (models/staging/stg_orders.sql)
+    column "customer_uuid" of relation "raw_orders" does not exist
+    LINE 7:   customer_uuid,
+  expected_root_cause: upstream source dropped or renamed the customer_uuid column
+  expected_next_action: diff raw_orders schema against the source contract, then update stg_orders
+
+- id: json-key-missing-04
+  category: schema_change
+  input: |
+    KeyError: 'shipping_address'
+      File "transforms/enrich_orders.py", line 88, in normalize
+        addr = record["shipping_address"]["postcode"]
+  expected_root_cause: upstream payload no longer always includes shipping_address
+  expected_next_action: make the field access tolerant and confirm the schema change with the producer
+
+- id: warehouse-perms-05
+  category: permissions
+  input: |
+    snowflake.connector.errors.ProgrammingError: 003001 (42501):
+    SQL access control error: Insufficient privileges to operate on table 'FCT_REVENUE'
+  expected_root_cause: the loader role lost INSERT or MERGE grants on FCT_REVENUE
+  expected_next_action: re-grant write privileges to the loader role and check the last grant-change audit entry
+
+- id: s3-access-denied-06
+  category: permissions
+  input: |
+    botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the PutObject operation:
+    Access Denied
+    s3://analytics-prod-landing/exports/2026-08-14/orders.parquet
+  expected_root_cause: the task's IAM role lacks s3:PutObject on the analytics-prod-landing prefix
+  expected_next_action: add s3:PutObject for that prefix to the role policy, or assume the role that already has it
+
+- id: null-rate-spike-07
+  category: upstream_data
+  input: |
+    dbt test failure: not_null_stg_customers_email
+    Got 4,812 results, configured to fail if != 0
+    Previous run: 3 failing rows
+  expected_root_cause: an upstream change caused a large jump in missing email values
+  expected_next_action: trace the source system change for customer email, then decide backfill vs. quarantine
+
+- id: rowcount-drop-08
+  category: upstream_data
+  input: |
+    Freshness/volume anomaly on raw_events: 12,400 rows loaded, 30-day median 1,180,000 (-98.9%)
+    Load job succeeded with no errors.
+  expected_root_cause: partial or truncated extract from the source, not a transform bug
+  expected_next_action: check the source extract window and API pagination, re-run the ingestion for the gap
+
+- id: duplicate-pk-09
+  category: upstream_data
+  input: |
+    Database Error in model dim_customer
+    duplicate key value violates unique constraint "dim_customer_pkey"
+    DETAIL: Key (customer_id)=(90218) already exists.
+  expected_root_cause: source delivered duplicate customer_id rows this batch
+  expected_next_action: dedupe in staging on the natural key and alert the source owner to the duplicates
+
+- id: missing-conn-10
+  category: config
+  input: |
+    airflow.exceptions.AirflowNotFoundException: The conn_id `snowflake_prod` isn't defined
+  expected_root_cause: the snowflake_prod connection is missing from this environment
+  expected_next_action: add the snowflake_prod connection/secret to this environment's config and redeploy
+
+- id: wrong-env-var-11
+  category: config
+  input: |
+    dbt.exceptions.DbtProfileError: Credentials in profile "warehouse", target "default" invalid
+    Runtime Error: 250001 (08001): Failed to connect to DB: account is empty
+  expected_root_cause: SNOWFLAKE_ACCOUNT is unset or blank in this environment
+  expected_next_action: set the SNOWFLAKE_ACCOUNT env var for this target and re-run
+
+- id: api-503-12
+  category: transient
+  input: |
+    requests.exceptions.HTTPError: 503 Server Error: Service Unavailable for url:
+    https://api.vendor.com/v2/contacts?page=7
+    Attempt 1 of 1.
+  expected_root_cause: transient upstream API outage, not a pipeline defect
+  expected_next_action: add bounded retries with backoff on 5xx and re-run; escalate only if it persists
+
+- id: conn-reset-13
+  category: transient
+  input: |
+    psycopg2.OperationalError: server closed the connection unexpectedly
+    This probably means the server terminated abnormally before or while processing the request.
+  expected_root_cause: dropped database connection, likely a network blip or server restart
+  expected_next_action: retry the task; if it recurs, check the warehouse for restarts or idle-timeout settings
+
+- id: s3-throttle-14
+  category: transient
+  input: |
+    botocore.exceptions.ClientError: An error occurred (SlowDown) when calling the GetObject operation (reached max retries: 4):
+    Please reduce your request rate.
+  expected_root_cause: S3 request rate exceeded the prefix throughput limit
+  expected_next_action: add jittered backoff and lower read concurrency, or spread keys across more prefixes
+
+- id: tz-bug-15
+  category: code_bug
+  input: |
+    AssertionError: event_date 2026-08-15 is in the future (run_date 2026-08-14)
+      File "transforms/sessionize.py", line 143, in validate
+  expected_root_cause: naive local timestamps compared against a UTC run date, so late-evening events look future-dated
+  expected_next_action: normalise event timestamps to UTC before the comparison and backfill affected partitions
+
+- id: div-zero-16
+  category: code_bug
+  input: |
+    ZeroDivisionError: division by zero
+      File "metrics/conversion.py", line 51, in conversion_rate
+        return conversions / sessions
+  expected_root_cause: a segment had zero sessions in the window and the metric does not guard against it
+  expected_next_action: return null (not zero) when the denominator is zero and add a test for empty segments
